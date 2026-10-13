@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>臉部穴位觀察 · MediaPipe</title>
+<style>
+
+* {
+  box-sizing:border-box}
+body {
+  margin:0;
+  background:#fcfaf7;
+  color:#414e4a;
+  font-family:"YouYuan","Microsoft JhengHei",sans-serif}
+main {
+  max-width:1080px;
+  margin:auto;
+  padding:28px 32px;
+  height:100svh;
+  display:flex;
+  flex-direction:column;
+  gap:16px}
+header {
+  display:flex;
+  justify-content:space-between;
+  gap:20px;
+  align-items:center}
+small {
+  font-size:14px;
+  color:#577266;
+  letter-spacing:1px}
+h1 {
+  font-size:30px;
+  margin:6px 0 0;
+  font-weight:400}
+button {
+  background:#414e4a;
+  color:white;
+  border:0;
+  border-radius:24px;
+  padding:13px 24px;
+  font:inherit;
+  white-space:nowrap;
+  cursor:pointer}
+button:disabled {
+  opacity:.5}
+section {
+  flex:1;
+  min-height:100px;
+  position:relative;
+  background:#e8ece8;
+  border-radius:12px;
+  overflow:hidden}
+canvas {
+  width:100%;
+  height:100%;
+  display:block}
+video {
+  position:absolute;
+  width:1px;
+  height:1px;
+  opacity:0;
+  pointer-events:none}
+#empty {
+  position:absolute;
+  inset:0;
+  display:grid;
+  place-content:center;
+  text-align:center;
+  color:#414e4a;
+  line-height:1.9;
+  padding:24px}
+#empty[hidden] {
+  display:none}
+#empty strong {
+  font-size:26px;
+  font-weight:500}
+#empty span {
+  color:#65716d;
+  font-size:16px}
+footer {
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  font-size:14px;
+  line-height:1.6}
+p {
+  margin:0}
+#status {
+  font-weight:400}
+.note {
+  color:#577266;
+  text-align:right}
+@media(max-width:600px) {
+  main {
+  padding:18px 16px;
+  gap:12px}
+h1 {
+  font-size:23px}
+small {
+  font-size:11px;
+  letter-spacing:0}
+button {
+  padding:12px 14px;
+  font-size:14px}
+footer {
+  display:block;
+  font-size:12px}
+.note {
+  text-align:left;
+  margin-top:6px}
+#empty strong {
+  font-size:20px}
+}
+
+
+button:focus-visible { outline: 3px solid #976b7b; outline-offset: 3px; }
+@media (max-height: 480px) { main { padding: 10px 16px; gap: 8px; } h1 { font-size: 20px; } footer { font-size: 11px; } }
+
+</style>
+
+</head>
+<body>
+<main>
+ <header><div><small>Google MediaPipe Face Landmarker / JavaScript</small><h1>臉部關鍵點與穴位觀察</h1></div><button id="toggle">開始鏡頭</button></header>
+ <section><video id="video" autoplay muted playsinline></video><canvas id="canvas"></canvas><div id="empty"><strong>用自己的臉，觀察穴位位置</strong><span>開啟鏡頭後，顯示臉部關鍵點與三個穴位估算標記</span></div></section>
+ <footer><p id="status" role="status">鏡頭尚未開啟</p><p class="note">綠點：模型關鍵點　金點：穴位估算<br>影像在本機處理。位置僅供學習探索，未經醫療定位驗證。</p></footer>
+</main>
+<script type="module">
+
+// 1. 載入模型：套件固定 0.10.32，模型和 WASM 都放在本機 lib。
+const video = document.querySelector('#video');
+const canvas = document.querySelector('#canvas');
+const ctx = canvas.getContext('2d');
+const button = document.querySelector('#toggle');
+const status = document.querySelector('#status');
+const empty = document.querySelector('#empty');
+let generation = 0;
+let model, stream, running = false, frame = 0, lastTime = -1, lastRun = 0;
+async function loadModel() {
+  const { FilesetResolver, FaceLandmarker } = await import('./lib/vision_bundle.mjs');
+  const files = await FilesetResolver.forVisionTasks('./lib/wasm');
+  return FaceLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: './lib/face_landmarker.task', delegate: 'CPU' },
+    runningMode: 'VIDEO', numFaces: 1,
+    outputFaceBlendshapes: false, outputFacialTransformationMatrixes: false
+  });
+}
+
+// 2. 穴位估算：沿用原型的幾何規則，尚未完成專家校準。
+function mix(a, b, t) {
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+function estimate(l) {
+  return [
+    { name: '攢竹 BL2', point: mix(l[55], l[107], 0.5) },
+    { name: '迎香 LI20', point: mix(l[98], l[129], 0.35) },
+    { name: '水溝 GV26', point: mix(l[2], l[0], 1 / 3) }
+  ];
+}
+
+// 3. 座標換算：完整保留影像比例，影片和標記都使用相同的自拍鏡像。
+function project(p, width, height, scale, ox, oy) {
+  return { x: ox + (1 - p.x) * width * scale, y: oy + p.y * height * scale };
+}
+function draw(landmarks) {
+  const box = canvas.getBoundingClientRect();
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(box.width * dpr);
+  canvas.height = Math.round(box.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#e8ece8"; ctx.fillRect(0, 0, box.width, box.height);
+  const w = box.width, h = box.height, vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.min(w / vw, h / vh);
+  const ox = (w - vw * scale) / 2, oy = (h - vh * scale) / 2;
+  ctx.save();
+  ctx.translate(w, 0); ctx.scale(-1, 1);
+  ctx.drawImage(video, ox, oy, vw * scale, vh * scale);
+  ctx.restore();
+  if (!landmarks) return;
+  const screen = p => project(p, vw, vh, scale, ox, oy);
+  ctx.fillStyle = '#a1e3c5';
+  for (const p of landmarks) {
+    const q = screen(p);
+    ctx.beginPath(); ctx.arc(q.x, q.y, 1.35, 0, Math.PI * 2); ctx.fill();
+  }
+  // 標籤放在右側並保持間距，連線指回估算點。
+  const font = w < 500 ? 13 : 18;
+  ctx.font = `600 ${font}px "Microsoft JhengHei", sans-serif`;
+  const items = estimate(landmarks);
+  items.forEach((item, i) => {
+    const p = screen(item.point);
+    const labelWidth = ctx.measureText(item.name).width + 22;
+    const x = w - labelWidth - 14;
+    const y = Math.max(32, Math.min(h - 124, h * 0.35)) + i * 46;
+    ctx.strokeStyle = '#f2d284'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(x, y); ctx.stroke();
+    ctx.fillStyle = '#f2d284'; ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#f5f3eb'; ctx.fillRect(x, y - 16, labelWidth, 32);
+    ctx.fillStyle = '#213e35'; ctx.fillText(item.name, x + 11, y + font * 0.35);
+  });
+}
+
+// 4. 每秒最多約 10 次推論，且同一影片影格只處理一次。
+function loop(now) {
+  if (!running) return;
+  try {
+    if (video.readyState >= 2 && video.currentTime !== lastTime && now - lastRun >= 100) {
+      lastTime = video.currentTime; lastRun = now;
+      const result = model.detectForVideo(video, now);
+      const landmarks = result.faceLandmarks[0];
+      draw(landmarks);
+      status.textContent = landmarks ? `已偵測 ${landmarks.length} 個關鍵點・請保持單人正面` : '未偵測到臉部，請正面看鏡頭';
+    }
+    frame = requestAnimationFrame(loop);
+  } catch (error) { stop(); status.textContent = '推論中斷，請重新開啟鏡頭。'; console.error(error); }
+}
+
+// 5. 唯一控制：開始或停止，停止時釋放攝影機。
+function stop() {
+  generation++;
+  running = false; cancelAnimationFrame(frame);
+  stream?.getTracks().forEach(track => track.stop());
+  stream = null; video.srcObject = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  empty.hidden = false; button.textContent = '開始鏡頭'; status.textContent = '鏡頭已停止';
+}
+button.addEventListener('click', async () => {
+  if (running) { stop(); return; }
+  const request = ++generation;
+  button.disabled = true; status.textContent = '正在載入模型與開啟鏡頭…';
+  try {
+    model ??= await loadModel();
+    if (request !== generation) return;
+    const openedStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    if (request !== generation) { openedStream.getTracks().forEach(track => track.stop()); return; }
+    stream = openedStream;
+    video.srcObject = stream; await video.play();
+    if (request !== generation) return;
+    running = true; lastTime = -1;
+    empty.hidden = true; button.textContent = '停止鏡頭';
+    frame = requestAnimationFrame(loop);
+  } catch (error) {
+    stop(); status.textContent = error.name === 'NotAllowedError' ? '鏡頭權限未開啟，請允許後重試。' : '無法啟動，請確認網路、鏡頭是否被占用，或以 Safari／Chrome 重試。';
+    console.error(error);
+  } finally { button.disabled = false; }
+});
+window.addEventListener('pagehide', stop);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stop();
+});
+if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+  status.textContent = '請用 HTTPS 或 localhost 開啟，並使用支援鏡頭的瀏覽器。'; button.disabled = true;
+}
+
+</script>
+</body>
+</html>
